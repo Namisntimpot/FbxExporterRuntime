@@ -8,6 +8,47 @@ using System.IO;
 
 using Autodesk.Fbx;
 
+public class FbxExporterGOTree
+{
+    public GameObject gameObject;
+    public FbxExporterGOTree parent = null;
+    public List<FbxExporterGOTree> childs = new List<FbxExporterGOTree>();
+    public FbxNode node = null;
+    public FbxExporterGOTree(GameObject go)
+    {
+        gameObject = go;
+    }
+    public void AddChild(FbxExporterGOTree node)
+    {
+        childs.Add(node);
+        node.parent = this;
+    }
+    public int ChildCount()
+    {
+        return childs == null ? 0 : childs.Count;
+    }
+    public FbxExporterGOTree GetParent()
+    {
+        return parent;
+    }
+    public GameObject GetGameObject()
+    {
+        return gameObject;
+    }
+
+    public static FbxExporterGOTree FromRootGameObject(GameObject root)
+    {
+        FbxExporterGOTree rootNode = new FbxExporterGOTree(root);
+        int childCount = root.transform.childCount;
+        for(int i=0; i<childCount; ++i)
+        {
+            Transform child = root.transform.GetChild(i);
+            rootNode.AddChild(FromRootGameObject(child.gameObject));
+        }
+        return rootNode;
+    }
+}
+
 public class FbxExporterRuntime
 {
     // including materials and textures.
@@ -21,11 +62,46 @@ public class FbxExporterRuntime
     public static int INTENSITY_SCALER = 10000;
     public static bool NO_ALPHA = true;    // ignore all alpha channels in all textures. 
 
+    public static StreamWriter logger = null;
+
+    private static void Log(string content, int space_level = 0){
+        if(logger != null){
+            string prefix = "";
+            for(int i=0; i<space_level * 4; ++i){
+                prefix += " ";
+            }
+            logger.WriteLine(prefix + content);
+            logger.Flush();
+        }
+    }
+
     private static string GetTemporaryDir()
     {
         string tmpdir = Application.dataPath;
         tmpdir = Path.Combine(tmpdir, "temp_fbx_exporter");
         return tmpdir;
+    }
+
+    public static Vector3 GetLocalTranslation(GameObject par, GameObject chi)
+    {
+        return par != null ? chi.transform.position - par.transform.position : chi.transform.position;
+    }
+
+    public static Vector3 GetLocalRotation(GameObject par, GameObject chi)
+    {
+        if (par == null)
+            return chi.transform.rotation.eulerAngles;
+        Transform t_par = par.transform, t_chi = chi.transform;
+        Quaternion rel = Quaternion.Inverse(t_par.rotation) * t_chi.rotation;
+        return rel.eulerAngles;
+    }
+
+    public static Vector3 GetLocalScale(GameObject par, GameObject chi)
+    {
+        if (par == null)
+            return chi.transform.lossyScale;
+        Vector3 lossyScalePar = par.transform.lossyScale, lossyScaleChi = chi.transform.lossyScale;
+        return new Vector3(lossyScaleChi.x / lossyScalePar.x, lossyScaleChi.y / lossyScalePar.y, lossyScaleChi.z / lossyScalePar.z);
     }
 
     /// <summary>
@@ -35,6 +111,9 @@ public class FbxExporterRuntime
     /// <param name="fileName"></param>
     public static void ExportFbx(GameObject[] unityObjects, string fileName)
     {
+        Log("Export Fbx Path: " + Path.GetFullPath(fileName) + ". No hierarchy.", 0);
+        Log("Temporary texture dir path: " + TEMP_DIR, 0);
+
         if (!Directory.Exists(TEMP_DIR))
         {
             Directory.CreateDirectory(TEMP_DIR);
@@ -59,14 +138,105 @@ public class FbxExporterRuntime
                 FbxScene scene = FbxScene.Create(fbxManager, "myScene");
 
                 // Export all meshes.
+                Log("Export Meshes...", 0);
                 ExportFBXMeshes(scene, unityObjects.Where((x)=>x.GetComponent<MeshFilter>() != null).ToArray());
 
                 // Export all Lights
+                Log("Export Lights...", 0);
                 ExportFBXLights(scene, unityObjects.Where((x) => x.GetComponent<Light>() != null).ToArray());
 
                 // Export the scene to the file.
                 exporter.Export(scene);
             }
+        }
+    }
+
+    public static void ExportFbx(FbxExporterGOTree[] trees, string fileName)
+    {
+        Log("Export Fbx Path: " + Path.GetFullPath(fileName) + ". With hierarchy.", 0);
+        Log("Temporary texture dir path: " + TEMP_DIR, 0);
+
+        if (!Directory.Exists(TEMP_DIR))
+        {
+            Directory.CreateDirectory(TEMP_DIR);
+        }
+        using (FbxManager fbxManager = FbxManager.Create())
+        {
+            // configure IO settings.
+            FbxIOSettings fbxIOSettings = FbxIOSettings.Create(fbxManager, Globals.IOSROOT);
+            fbxIOSettings.SetBoolProp(Globals.EXP_FBX_MATERIAL, EXPORT_MATERIAL);
+            fbxIOSettings.SetBoolProp(Globals.EXP_FBX_TEXTURE, EXPORT_MATERIAL);
+            fbxIOSettings.SetBoolProp(Globals.EXP_FBX_EMBEDDED, EXPORT_EMBEDDED);
+            fbxManager.SetIOSettings(fbxIOSettings);
+
+            // Export the scene
+            using (FbxExporter exporter = FbxExporter.Create(fbxManager, "myExporter"))
+            {
+
+                // Initialize the exporter.
+                bool status = exporter.Initialize(fileName, -1, fbxManager.GetIOSettings());
+
+                // Create a new scene to export
+                FbxScene scene = FbxScene.Create(fbxManager, "myScene");
+
+                // traverse all trees.
+                foreach(var tree in trees)
+                {
+                    Log("Traverse tree " + tree.gameObject.name, 0);
+                    ExportFBXTraverseTree(scene, tree);
+                }
+                // Export the scene to the file.
+                exporter.Export(scene);
+            }
+        }
+    }
+
+    private static void ExportFBXTraverseTree(FbxScene scene, FbxExporterGOTree tree)
+    {
+        GameObject thisObj = tree.gameObject, par = tree.parent != null ? tree.parent.gameObject : null;
+        FbxNode thisNode = FbxNode.Create(scene, thisObj.name);
+        Vector3 lcltrans = GetLocalTranslation(par, thisObj) * DISTANCE_SCALER;
+        Vector3 lclrot = GetLocalRotation(par, thisObj);
+        Vector3 lclscale = GetLocalScale(par, thisObj);
+        thisNode.LclTranslation.Set(new FbxDouble3(lcltrans.x, lcltrans.y, lcltrans.z));
+        thisNode.LclRotation.Set(new FbxDouble3(lclrot.x, lclrot.y, lclrot.z));
+        thisNode.LclScaling.Set(new FbxDouble3(lclscale.x, lclscale.y, lclscale.z));
+        MeshFilter thisMeshFilter = thisObj.GetComponent<MeshFilter>();
+        Light thisLight = thisObj.GetComponent<Light>();
+        if(thisMeshFilter != null)
+        {
+            FbxMesh fbxMesh = ExportFBXMeshGeometryFromGameObject(scene, thisMeshFilter);
+            thisNode.SetNodeAttribute(fbxMesh);
+            thisNode.SetShadingMode(FbxNode.EShadingMode.eTextureShading);
+            if (EXPORT_MATERIAL)
+            {
+                ExportFBXBindMaterials(fbxMesh, thisObj);
+            }
+        }
+        if(thisLight != null)
+        {
+            FbxLight fbxLight = ExportFBXLight(scene, thisLight);
+            if(thisMeshFilter  != null)   // This gameobject has both mesh and light.
+            {
+                FbxNode tmpLightNode = FbxNode.Create(scene, thisObj.name + "_light"); // translation, rotation, scale are all default.
+                tmpLightNode.SetNodeAttribute(fbxLight);
+                thisNode.AddChild(tmpLightNode);
+            }
+            else     // This gameobject has only light component.
+            {
+                thisNode.SetNodeAttribute(fbxLight);
+            }
+        }
+
+        tree.node = thisNode;
+        if (tree.parent == null)
+            scene.GetRootNode().AddChild(thisNode);
+        else
+            tree.parent.node.AddChild(thisNode);
+
+        foreach(FbxExporterGOTree child in tree.childs)
+        {
+            ExportFBXTraverseTree(scene, child);
         }
     }
 
@@ -77,6 +247,9 @@ public class FbxExporterRuntime
         {
             Mesh mesh = meshFilter.sharedMesh;
             if (mesh == null) { continue; }
+            
+            Log("Mesh: " + meshFilter.gameObject.name, 1);
+
             FbxNode fbxNode = FbxNode.Create(scene, meshFilter.name);
 
             // Set transformations
@@ -85,11 +258,11 @@ public class FbxExporterRuntime
             fbxNode.LclRotation.Set(new FbxDouble3(meshFilter.transform.eulerAngles.x,
                                                    meshFilter.transform.eulerAngles.y,
                                                    meshFilter.transform.eulerAngles.z));
-            fbxNode.LclScaling.Set(new FbxDouble3(meshFilter.transform.localScale.x,
-                                                  meshFilter.transform.localScale.y,
-                                                  meshFilter.transform.localScale.z));
+            fbxNode.LclScaling.Set(new FbxDouble3(meshFilter.transform.lossyScale.x,
+                                                  meshFilter.transform.lossyScale.y,
+                                                  meshFilter.transform.lossyScale.z));
 
-            // µ¼Èë¼¸ºÎÊý¾Ý
+            // ï¿½ï¿½ï¿½ë¼¸ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
             FbxMesh fbxMesh = ExportFBXMeshGeometryFromGameObject(scene, meshFilter);
 
             fbxNode.SetNodeAttribute(fbxMesh);
@@ -99,7 +272,7 @@ public class FbxExporterRuntime
             //meshNode.SetNodeAttribute(fbxMesh);
             //meshNode.SetShadingMode(FbxNode.EShadingMode.eTextureShading);
 
-            // µ¼Èë²ÄÖÊºÍÎÆÀíÊý¾Ý
+            // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Êºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
             if (EXPORT_MATERIAL)
             {
                 ExportFBXBindMaterials(fbxMesh, meshFilter.gameObject);
@@ -118,7 +291,7 @@ public class FbxExporterRuntime
 
         // Set vertex positions
         Vector3[] vertices = unityMesh.vertices;
-        Debug.Log($"Mesh: {unityMesh.name}, Vertices: {vertices.Length}, Triangles: {unityMesh.triangles.Length}");
+        // Debug.Log($"Mesh: {unityMesh.name}, Vertices: {vertices.Length}, Triangles: {unityMesh.triangles.Length}");
 
         fbxMesh.InitControlPoints(vertices.Length);
         for (int i = 0; i < vertices.Length; i++)
@@ -197,9 +370,10 @@ public class FbxExporterRuntime
     {
         MeshRenderer meshRenderer = unityObject.GetComponent<MeshRenderer>();
         Mesh mesh = unityObject.GetComponent<MeshFilter>().sharedMesh;
+        Log("Handling materials. NumSubMeshes: " + mesh.subMeshCount.ToString() + ", NumMaterials: " + meshRenderer.sharedMaterials.Length, 2);
         if (mesh.subMeshCount > 1 && mesh.subMeshCount == meshRenderer.sharedMaterials.Length)
         {
-            // ´¦ÀísubMesh
+            // ï¿½ï¿½ï¿½ï¿½subMesh
             FbxLayerElementMaterial fbxLayerElementMaterial = FbxLayerElementMaterial.Create(fbxMesh, "Materials");
             fbxLayerElementMaterial.SetMappingMode(FbxLayerElement.EMappingMode.eByPolygon);
             fbxLayerElementMaterial.SetReferenceMode(FbxLayerElement.EReferenceMode.eIndexToDirect);
@@ -212,12 +386,12 @@ public class FbxExporterRuntime
                                           topo == MeshTopology.Lines ? 2 : 1;
                 for (int i = 0; i < subMeshDescriptor.indexCount / indices_per_primitive; ++i)
                 {
-                    fbxLayerElementMaterial.GetIndexArray().Add(subMeshId);   // ÉèÖÃÄÄ¸ö¶à±ßÐÎÓÃÄÄ¸ö²ÄÖÊ
+                    fbxLayerElementMaterial.GetIndexArray().Add(subMeshId);   // ï¿½ï¿½ï¿½ï¿½ï¿½Ä¸ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä¸ï¿½ï¿½ï¿½ï¿½ï¿½
                 }
             }
             fbxMesh.GetLayer(0).SetMaterials(fbxLayerElementMaterial);
 
-            // ´¦ÀíËùÓÐ×Ó²ÄÖÊ
+            // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ó²ï¿½ï¿½ï¿½
             foreach (Material mat in meshRenderer.sharedMaterials)
             {
                 FbxSurfacePhong fbxMaterial = ExportFBXParseMaterial(fbxMesh, mat);
@@ -226,16 +400,16 @@ public class FbxExporterRuntime
         }
         else
         {
-            // Ö»ÓÐµ¥¸ö²ÄÖÊ
+            // Ö»ï¿½Ðµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
             Material mat = meshRenderer.sharedMaterials[0];
-            // ÔÚlayerÖÐ´æÏÂmaterialµÄ¶¨Òå
+            // ï¿½ï¿½layerï¿½Ð´ï¿½ï¿½ï¿½materialï¿½Ä¶ï¿½ï¿½ï¿½
             FbxLayerElementMaterial fbxLayerElementMaterial = FbxLayerElementMaterial.Create(fbxMesh, mat.name);
             fbxLayerElementMaterial.SetMappingMode(FbxLayerElement.EMappingMode.eAllSame);
             fbxLayerElementMaterial.SetReferenceMode(FbxLayerElement.EReferenceMode.eIndexToDirect);
             fbxLayerElementMaterial.GetIndexArray().Add(0);
             fbxMesh.GetLayer(0).SetMaterials(fbxLayerElementMaterial);
 
-            // ½«²ÄÖÊ×ª»»ÎªfbxµÄ²ÄÖÊ.
+            // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½×ªï¿½ï¿½Îªfbxï¿½Ä²ï¿½ï¿½ï¿½.
             FbxSurfacePhong fbxMaterial = ExportFBXParseMaterial(fbxMesh, mat);
             fbxMesh.GetNode().AddMaterial(fbxMaterial);
         }
@@ -243,6 +417,7 @@ public class FbxExporterRuntime
 
     private static FbxSurfacePhong ExportFBXParseMaterial(FbxMesh fbxMesh, Material material)
     {
+        Log("Handling Material: " + material.name, 3);
         FbxSurfacePhong fbxMaterial = FbxSurfacePhong.Create(fbxMesh, material.name);
         FbxDouble3 defaultColor = new FbxDouble3(0, 0, 0);
         fbxMaterial.Emissive.Set(ExportFBXColorConversion(material.GetColor("_EmissionColor")));
@@ -254,8 +429,7 @@ public class FbxExporterRuntime
         fbxMaterial.TransparencyFactor.Set(0);
         fbxMaterial.TransparentColor.Set(new FbxColor(0, 0, 0));
 
-
-        // °ó¶¨ÒÔÏÂ²ÄÖÊ£º_MainTex -> Diffuse; _BumpMap -> NormalMap;
+        // ï¿½ï¿½ï¿½ï¿½ï¿½Â²ï¿½ï¿½Ê£ï¿½_MainTex -> Diffuse; _BumpMap -> NormalMap;
         string tmpTextureDir = TEMP_DIR;
         // _MainTex
         string mainTexPath = null;
@@ -266,7 +440,7 @@ public class FbxExporterRuntime
             byte[] mainTexPng = mainTex.EncodeToPNG();
             if (mainTexPng != null)
             {
-                // ÏÈ±£´æÎªÍ¼Æ¬£¬ÔÙÉèÖÃFbxFileTexture
+                // ï¿½È±ï¿½ï¿½ï¿½ÎªÍ¼Æ¬ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½FbxFileTexture
                 mainTexPath = Path.Combine(tmpTextureDir, mainTex.name + ".png");
                 File.WriteAllBytes(mainTexPath, mainTexPng);
             }
@@ -290,7 +464,6 @@ public class FbxExporterRuntime
         Texture2D bumpMap = material.GetTexture("_BumpMap") as Texture2D;
         if (bumpMap != null)
         {
-            Debug.Log(bumpMap.GetPixel(0, 0));
             bumpMap = ExportFBXGetUncompressedTexture(bumpMap, true, noAlpha: NO_ALPHA);
             byte[] bumpMapPng = bumpMap.EncodeToPNG();
             if (bumpMapPng != null)
@@ -322,31 +495,13 @@ public class FbxExporterRuntime
         Light[] lightObjs = lightGameObjects.Select((x) => x.GetComponent<Light>()).ToArray();
 
         FbxNode lightGroupNode = FbxNode.Create(scene, "Lights");
-        Dictionary<LightType, FbxLight.EType> lightTypeMap = new Dictionary<LightType, FbxLight.EType>();
-        lightTypeMap[LightType.Directional] = FbxLight.EType.eDirectional;
-        lightTypeMap[LightType.Point] = FbxLight.EType.ePoint;
-        lightTypeMap[LightType.Spot] = FbxLight.EType.eSpot;
-        lightTypeMap[LightType.Area] = FbxLight.EType.eArea;
         foreach (Light lightObj in lightObjs)
         {
-            FbxLight fbxLight = FbxLight.Create(scene, lightObj.name);
-            if (lightTypeMap.TryGetValue(lightObj.type, out FbxLight.EType fbxLightType))
-            {
-                fbxLight.LightType.Set(fbxLightType);
-            }
-            else
-            {
-                fbxLight.LightType.Set(FbxLight.EType.ePoint);
-            }
-            fbxLight.Intensity.Set(lightObj.intensity * (lightObj.type == LightType.Directional ? 1 : INTENSITY_SCALER));
-            fbxLight.Color.Set(ExportFBXColorConversion(lightObj.color));
-            fbxLight.CastShadows.Set(true);
-            fbxLight.ShadowColor.Set(new FbxColor(0, 0, 0));
-
+            FbxLight fbxLight = ExportFBXLight(scene, lightObj);
             FbxNode lightNode = FbxNode.Create(scene, lightObj.name + "_node");
             lightNode.SetNodeAttribute(fbxLight);
 
-            // ÉèÖÃ¹âÔ´Î»ÖÃ£¡
+            // ï¿½ï¿½ï¿½Ã¹ï¿½Ô´Î»ï¿½Ã£ï¿½
             Vector3 pos = lightObj.transform.position * DISTANCE_SCALER;
             lightNode.LclTranslation.Set(new FbxDouble3(pos.x,pos.y,pos.z));
             lightNode.LclRotation.Set(new FbxDouble3(lightObj.transform.eulerAngles.x,
@@ -362,6 +517,29 @@ public class FbxExporterRuntime
         scene.GetRootNode().AddChild(lightGroupNode);
     }
 
+    private static FbxLight ExportFBXLight(FbxScene scene, Light lightObj)
+    {
+        Log("Export Light: " + lightObj.gameObject.name + ", type: " + lightObj.type.ToString(), 1);
+        Dictionary<LightType, FbxLight.EType> lightTypeMap = new Dictionary<LightType, FbxLight.EType>() {
+            {LightType.Directional,  FbxLight.EType.eDirectional}, {LightType.Point, FbxLight.EType.ePoint},
+            {LightType.Spot, FbxLight.EType.eSpot }, {LightType.Area, FbxLight.EType.eArea}
+        };
+        FbxLight fbxLight = FbxLight.Create(scene, lightObj.name);
+        if (lightTypeMap.TryGetValue(lightObj.type, out FbxLight.EType fbxLightType))
+        {
+            fbxLight.LightType.Set(fbxLightType);
+        }
+        else
+        {
+            fbxLight.LightType.Set(FbxLight.EType.ePoint);
+        }
+        fbxLight.Intensity.Set(lightObj.intensity * (lightObj.type == LightType.Directional ? 1 : INTENSITY_SCALER));
+        fbxLight.Color.Set(ExportFBXColorConversion(lightObj.color));
+        fbxLight.CastShadows.Set(true);
+        fbxLight.ShadowColor.Set(new FbxColor(0, 0, 0));
+        return fbxLight;
+    }
+
     private static FbxColor ExportFBXColorConversion(Color color)
     {
         if (color == null)
@@ -373,6 +551,7 @@ public class FbxExporterRuntime
 
     private static Texture2D ExportFBXGetUncompressedTexture(Texture2D tex, bool isNormalMap = false, bool noAlpha = true)
     {
+        Log("Handling Texture: " +  tex.name, 4);
         var format = tex.format;
         bool isCompressed = ExportFBXTextureFormatIsCompressed(format);
         if (!isCompressed)

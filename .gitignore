@@ -7,3 +7,6 @@
 /Logs
 /obj
 /UserSettings
+/Build
+/Temp
+*.fbx
